@@ -26,7 +26,6 @@ PAGES_PER_CATEGORY = 2
 TIMEOUT = 20
 MIN_DELAY = 1.0
 MAX_DELAY = 2.5
-MIN_BUDGET = 300_000
 
 HEADERS = {
     "User-Agent": (
@@ -181,10 +180,6 @@ def filter_by_date(tenders: list[Tender], cutoff: str) -> list[Tender]:
     return [t for t in tenders if t.published_date and t.published_date >= cutoff]
 
 
-def filter_by_budget(tenders: list[Tender], min_budget: int) -> list[Tender]:
-    return [t for t in tenders if t.budget_min is None or t.budget_min >= min_budget]
-
-
 def main() -> int:
     default_cutoff = (date.today() - timedelta(days=2)).isoformat()
     ap = argparse.ArgumentParser(description="Workspace.ru tender parser")
@@ -217,10 +212,6 @@ def main() -> int:
     before = len(tenders)
     tenders = filter_by_date(tenders, args.cutoff_date)
     print(f"После фильтра по дате ≥ {args.cutoff_date}: {len(tenders)} (было {before})")
-
-    before = len(tenders)
-    tenders = filter_by_budget(tenders, MIN_BUDGET)
-    print(f"После фильтра по бюджету (min ≥ {MIN_BUDGET:,} ₽ либо бюджет не указан): {len(tenders)} (было {before})")
 
     if tenders:
         print(f"\n=== Шаг 2: обогащение организатором ({len(tenders)} тендеров) ===")
