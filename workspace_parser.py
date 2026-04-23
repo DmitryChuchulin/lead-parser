@@ -1,50 +1,32 @@
 #!/usr/bin/env python3
-"""Парсер тендеров с workspace.ru по категориям."""
+"""Парсер тендеров с workspace.ru через RSS-ленту."""
 from __future__ import annotations
 
 import argparse
 import json
-import random
 import re
 import sys
-import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Optional
-from urllib.parse import urljoin
 
-import requests
-from bs4 import BeautifulSoup
+import feedparser
 
-BASE_URL = "https://workspace.ru"
-CATEGORIES = {
-    "web-development": "Разработка сайтов",
-    "apps-development": "Мобильные приложения",
-    "crm": "CRM / ПО / чат-боты",
-}
-PAGES_PER_CATEGORY = 2
-TIMEOUT = 20
-MIN_DELAY = 1.0
-MAX_DELAY = 2.5
+RSS_URL = "https://workspace.ru/tenders/rss/"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
+# Порядок важен: apps проверяется раньше web, чтобы "разработка мобильного
+# приложения" классифицировалась как apps, а не как web по слову "разработка".
+CATEGORY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
+    ("apps-development", ("мобильн", "приложен")),
+    ("crm",              ("crm", "erp")),
+    ("web-development",  ("сайт", "разработка")),
+]
+CATEGORIES = [slug for slug, _ in CATEGORY_KEYWORDS]
 
-RU_MONTHS = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
-    "мая": 5, "июня": 6, "июля": 7, "августа": 8,
-    "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-}
-
-DATE_RE = re.compile(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", re.I)
-NUM_RE = re.compile(r"\d[\d\s ]*")
+DATE_DMY_RE = re.compile(r"(\d{2})\.(\d{2})\.(\d{4})")
+FIELD_RE = re.compile(r"<b>\s*([^<]+?)\s*</b>\s*:\s*([^<]*)", re.I)
+BUDGET_IN_TITLE_RE = re.compile(r"Бюджет:\s*(.+?)$", re.I)
+NUM_RE = re.compile(r"\d[\d\s ]*")
 
 
 @dataclass
@@ -58,131 +40,86 @@ class Tender:
     url: str
     published_date: str
     category: str
+    service: str
 
 
-def fetch(session: requests.Session, url: str) -> Optional[str]:
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=TIMEOUT)
-    except requests.RequestException as exc:
-        print(f"    ошибка запроса {url}: {exc}", file=sys.stderr)
-        return None
-    if resp.status_code != 200:
-        print(f"    HTTP {resp.status_code} {url}", file=sys.stderr)
-        return None
-    return resp.text
+def parse_description_fields(summary: str) -> dict[str, str]:
+    """Вытаскивает пары <b>Лейбл</b>: значение из HTML description RSS."""
+    fields: dict[str, str] = {}
+    for label, value in FIELD_RE.findall(summary or ""):
+        fields[label.strip().lower().rstrip(":")] = value.strip()
+    return fields
 
 
-def parse_ru_date(text: str) -> str:
-    """'23 апреля 2026' → '2026-04-23'. Возвращает '' если не распознано."""
-    m = DATE_RE.search(text or "")
+def parse_dmy(s: str) -> str:
+    """'23.04.2026' → '2026-04-23'. '' если не распознано."""
+    m = DATE_DMY_RE.search(s or "")
     if not m:
         return ""
-    day, month_word, year = m.group(1), m.group(2).lower(), m.group(3)
-    month = RU_MONTHS.get(month_word)
-    if not month:
-        return ""
-    return f"{year}-{month:02d}-{int(day):02d}"
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
 
 
-def parse_budget(text: str) -> tuple[Optional[int], Optional[int], str]:
-    """'100 000 - 400 000' → (100000, 400000, '100 000 - 400 000 руб')."""
-    text = (text or "").strip()
-    if not text:
+def parse_budget_from_title(title: str) -> tuple[Optional[int], Optional[int], str]:
+    """'... Бюджет: от 100 000 до 400 000 руб' → (100000, 400000, 'от 100 000 до 400 000 руб')."""
+    m = BUDGET_IN_TITLE_RE.search(title or "")
+    if not m:
         return None, None, ""
-    nums = [int(re.sub(r"\s", "", n)) for n in NUM_RE.findall(text)]
+    raw = m.group(1).strip()
+    nums = [int(re.sub(r"\s", "", n)) for n in NUM_RE.findall(raw)]
     if not nums:
-        return None, None, text
-    display = f"{text} руб" if "руб" not in text.lower() else text
+        return None, None, raw
     if len(nums) == 1:
-        return nums[0], nums[0], display
-    return nums[0], nums[-1], display
+        return nums[0], nums[0], raw
+    return nums[0], nums[-1], raw
 
 
-def parse_card(card, category: str) -> Optional[Tender]:
-    title_a = card.select_one("div.b-tender__title a[href]")
-    if not title_a:
+def classify(service: str) -> Optional[str]:
+    """Определяет slug категории по 'Требуемая услуга'. None = не подходит."""
+    s = (service or "").lower()
+    for slug, keywords in CATEGORY_KEYWORDS:
+        if any(k in s for k in keywords):
+            return slug
+    return None
+
+
+def entry_to_tender(entry) -> Optional[Tender]:
+    summary = entry.get("summary", "")
+    fields = parse_description_fields(summary)
+
+    service = fields.get("требуемая услуга") or fields.get("требуемые услуги") or ""
+    category = classify(service)
+    if category is None:
         return None
-    url = urljoin(BASE_URL, title_a["href"])
-    title = title_a.get_text(strip=True)
 
-    budget_el = card.select_one(
-        "div.b-tender__block--title .b-tender__info-item-text"
-    )
-    budget_raw = ""
-    if budget_el:
-        budget_raw = re.sub(r"\s+", " ", budget_el.get_text(" ", strip=True)).strip()
-    b_min, b_max, budget_text = parse_budget(budget_raw)
+    organizer = fields.get("организатор", "")
+    deadline = parse_dmy(fields.get("крайний срок приема заявок", ""))
+    published_iso = parse_dmy(fields.get("дата публикации", ""))
+    if not published_iso:
+        pp = getattr(entry, "published_parsed", None)
+        if pp:
+            published_iso = f"{pp.tm_year}-{pp.tm_mon:02d}-{pp.tm_mday:02d}"
 
-    published_iso = ""
-    deadline_iso = ""
-    for item in card.select("div.b-tender__info-item"):
-        title_el = item.select_one(".b-tender__info-item-title")
-        text_el = item.select_one(".b-tender__info-item-text")
-        if not title_el or not text_el:
-            continue
-        label = title_el.get_text(strip=True).lower().rstrip(":")
-        value_text = text_el.get_text(" ", strip=True)
-        if label.startswith("опубликован"):
-            published_iso = parse_ru_date(value_text)
-        elif "срок" in label or "заявок" in label:
-            deadline_iso = parse_ru_date(value_text)
+    raw_title = entry.get("title", "")
+    bmin, bmax, btext = parse_budget_from_title(raw_title)
+    clean_title = re.sub(r"\.\s*Бюджет:.*$", "", raw_title).strip()
 
     return Tender(
-        title=title,
-        organizer="",
-        budget_min=b_min,
-        budget_max=b_max,
-        budget_text=budget_text,
-        deadline=deadline_iso,
-        url=url,
+        title=clean_title,
+        organizer=organizer,
+        budget_min=bmin,
+        budget_max=bmax,
+        budget_text=btext,
+        deadline=deadline,
+        url=entry.get("link", ""),
         published_date=published_iso,
         category=category,
+        service=service,
     )
-
-
-def collect_category(session: requests.Session, slug: str, pages: int) -> list[Tender]:
-    tenders: list[Tender] = []
-    for page in range(1, pages + 1):
-        url = f"{BASE_URL}/tenders/{slug}/?SORT=public&ORDER=0&page={page}"
-        print(f"  [{slug} p{page}] {url}")
-        html = fetch(session, url)
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            cards = soup.select("div.vacancies__card._tender")
-            parsed = [t for t in (parse_card(c, slug) for c in cards) if t]
-            print(f"    карточек: {len(cards)}, распарсено: {len(parsed)}")
-            tenders.extend(parsed)
-        time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-    return tenders
-
-
-def enrich_organizer(session: requests.Session, tenders: list[Tender]) -> list[Tender]:
-    for i, t in enumerate(tenders, 1):
-        html = fetch(session, t.url)
-        if html:
-            soup = BeautifulSoup(html, "html.parser")
-            for inner in soup.select("div.card-info__inner"):
-                title_el = inner.select_one(".card-info__title")
-                desc_el = inner.select_one(".card-info__desc")
-                if not title_el or not desc_el:
-                    continue
-                # "Oрганизатор" в HTML приходит с латинской O — match по общему хвосту
-                if "рганизатор" in title_el.get_text(strip=True):
-                    t.organizer = desc_el.get_text(strip=True)
-                    break
-        print(f"  [{i}/{len(tenders)}] организатор='{t.organizer}'  {t.url}")
-        if i < len(tenders):
-            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-    return tenders
-
-
-def filter_by_date(tenders: list[Tender], cutoff: str) -> list[Tender]:
-    return [t for t in tenders if t.published_date and t.published_date >= cutoff]
 
 
 def main() -> int:
     default_cutoff = (date.today() - timedelta(days=2)).isoformat()
-    ap = argparse.ArgumentParser(description="Workspace.ru tender parser")
+    ap = argparse.ArgumentParser(description="Workspace.ru tender parser (RSS)")
     ap.add_argument(
         "--cutoff-date",
         default=default_cutoff,
@@ -195,31 +132,40 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    session = requests.Session()
+    print(f"=== RSS: {RSS_URL} ===")
+    feed = feedparser.parse(RSS_URL)
+    if feed.bozo:
+        print(f"RSS warning: {feed.bozo_exception}", file=sys.stderr)
+    print(f"Всего entries: {len(feed.entries)}")
 
-    print(f"=== Шаг 1: сбор карточек из {len(CATEGORIES)} категорий × {PAGES_PER_CATEGORY} стр. ===")
-    all_tenders: list[Tender] = []
-    for slug in CATEGORIES:
-        all_tenders.extend(collect_category(session, slug, PAGES_PER_CATEGORY))
-    print(f"Всего карточек: {len(all_tenders)}")
-
-    seen: dict[str, Tender] = {}
-    for t in all_tenders:
-        seen.setdefault(t.url, t)
-    tenders = list(seen.values())
-    print(f"После дедупликации по URL: {len(tenders)}")
+    tenders: list[Tender] = []
+    seen_urls: set[str] = set()
+    skipped_category = 0
+    for entry in feed.entries:
+        t = entry_to_tender(entry)
+        if t is None:
+            skipped_category += 1
+            continue
+        if t.url and t.url in seen_urls:
+            continue
+        seen_urls.add(t.url)
+        tenders.append(t)
+    print(f"Отсеяно по категории (ни одно из: разработка/сайт/мобильн/приложен/CRM/ERP): {skipped_category}")
+    print(f"Подходящих по категории: {len(tenders)}")
 
     before = len(tenders)
-    tenders = filter_by_date(tenders, args.cutoff_date)
+    tenders = [
+        t for t in tenders
+        if t.published_date and t.published_date >= args.cutoff_date
+    ]
     print(f"После фильтра по дате ≥ {args.cutoff_date}: {len(tenders)} (было {before})")
-
-    if tenders:
-        print(f"\n=== Шаг 2: обогащение организатором ({len(tenders)} тендеров) ===")
-        enrich_organizer(session, tenders)
 
     print(f"\nИтого: {len(tenders)}")
     for t in tenders:
-        print(f"  [{t.published_date}] {t.title} | {t.budget_text} | {t.organizer} | {t.url}")
+        print(f"  [{t.published_date}] [{t.category}] {t.title}")
+        print(f"     бюджет: {t.budget_text or '—'} | дедлайн: {t.deadline or '—'} | орг: {t.organizer or '—'}")
+        print(f"     услуга: {t.service}")
+        print(f"     {t.url}")
 
     if args.sheets:
         import sheets_writer
