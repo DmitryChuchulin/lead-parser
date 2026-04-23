@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from workspace_parser import Tender
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DEFAULT_WORKSHEET_NAME = "workspace"
+DEFAULT_WORKSHEET_NAME = "Workspace"
 DEFAULT_HEADERS = [
     "Название", "Организатор", "Бюджет", "Дедлайн",
     "Ссылка", "Площадка", "Дата публикации",
