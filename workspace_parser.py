@@ -11,8 +11,19 @@ from datetime import date, timedelta
 from typing import Optional
 
 import feedparser
+import requests
 
 RSS_URL = "https://workspace.ru/tenders/rss/"
+TIMEOUT = 20
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
 
 # Порядок важен: apps проверяется раньше web, чтобы "разработка мобильного
 # приложения" классифицировалась как apps, а не как web по слову "разработка".
@@ -133,7 +144,20 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"=== RSS: {RSS_URL} ===")
-    feed = feedparser.parse(RSS_URL)
+    try:
+        resp = requests.get(RSS_URL, headers=HEADERS, timeout=TIMEOUT)
+    except requests.RequestException as exc:
+        print(f"ОШИБКА запроса RSS: {exc}", file=sys.stderr)
+        return 1
+    print(f"HTTP {resp.status_code}, длина тела: {len(resp.text)} символов")
+    print(f"Первые 200 символов тела:\n{resp.text[:200]!r}")
+    if resp.status_code != 200:
+        print(f"ОШИБКА: RSS вернул HTTP {resp.status_code}", file=sys.stderr)
+        return 1
+    if not resp.text.strip():
+        print("ОШИБКА: RSS вернул пустое тело", file=sys.stderr)
+        return 1
+    feed = feedparser.parse(resp.content)
     if feed.bozo:
         print(f"RSS warning: {feed.bozo_exception}", file=sys.stderr)
     print(f"Всего entries: {len(feed.entries)}")
