@@ -1,0 +1,66 @@
+name: Daily workspace.ru parse
+
+on:
+  schedule:
+    - cron: "0 6 * * *"    # 09:00 МСК
+    - cron: "0 11 * * *"   # 14:00 МСК
+    - cron: "0 15 * * *"   # 18:00 МСК
+  workflow_dispatch:
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run parser
+        id: run
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: |
+          set -o pipefail
+          python workspace_parser.py --sheets 2>&1 | tee run.log
+          line=$(grep '^COUNTS_JSON=' run.log | tail -n 1 || true)
+          counts="${line#COUNTS_JSON=}"
+          if [ -z "$counts" ]; then
+            counts='{"web-development": 0, "apps-development": 0, "crm": 0}'
+          fi
+          echo "counts=$counts" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram (success)
+        if: success()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          COUNTS: ${{ steps.run.outputs.counts }}
+        run: |
+          read web app crm < <(python3 -c "import json, os; d = json.loads(os.environ['COUNTS']); print(d.get('web-development', 0), d.get('apps-development', 0), d.get('crm', 0))")
+          text="✅ workspace.ru
+          🌐 Сайты: ${web}
+          📱 Мобилки: ${app}
+          ⚙️ CRM: ${crm}"
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${text}"
+
+      - name: Notify Telegram (failure)
+        if: failure()
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=❌ workspace.ru: ошибка! Логи: https://github.com/DmitryChuchulin/lead-parser/actions"
