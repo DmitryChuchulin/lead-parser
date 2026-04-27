@@ -1,10 +1,6 @@
 name: Daily workspace.ru parse
 
 on:
-  schedule:
-    - cron: "0 6 * * *"    # 09:00 МСК
-    - cron: "0 11 * * *"   # 14:00 МСК
-    - cron: "0 15 * * *"   # 18:00 МСК
   workflow_dispatch:
 
 jobs:
